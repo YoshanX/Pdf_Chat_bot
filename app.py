@@ -4,7 +4,8 @@ import tempfile
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import FAISS
+# Switched from FAISS to Chroma
+from langchain_community.vectorstores import Chroma
 from huggingface_hub import InferenceClient
 from dotenv import load_dotenv
 
@@ -33,7 +34,7 @@ def initialize_embedding_model():
 def load_pdf_and_create_vector_store(pdf_content_bytes):
     """
     Loads PDF, splits text, retrieves the cached embeddings model, 
-    and creates the FAISS vector store.
+    and creates the Chroma vector store.
     """
     with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
         tmp_file.write(pdf_content_bytes)
@@ -44,14 +45,21 @@ def load_pdf_and_create_vector_store(pdf_content_bytes):
         loader = PyPDFLoader(pdf_path)
         data = loader.load()
 
+        # Increased overlap to ensure context (like dates next to names) isn't cut off.
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,
-            chunk_overlap=50
+            chunk_overlap=100
         )
         docs = text_splitter.split_documents(data)
 
         with st.spinner("Processing document and creating knowledge base..."):
-            db = FAISS.from_documents(docs, embeddings) 
+            # Switched to Chroma
+            # We use an ephemeral client (no persist_directory) for session-based storage
+            db = Chroma.from_documents(
+                documents=docs, 
+                embedding=embeddings,
+                collection_name="pdf_chat_temp"
+            )
         
         st.success("Knowledge base created successfully! You can now ask questions.")
         return db
@@ -77,22 +85,34 @@ def format_chat_history(history):
     return "\n".join(formatted[-6:])
 
 
-def get_pdf_answer(question: str, db: FAISS, qa_client: InferenceClient, chat_history: list):
+def get_pdf_answer(question: str, db: Chroma, qa_client: InferenceClient, chat_history: list):
     """
-    Executes the advanced RAG pipeline with History-Aware Retrieval (HAR)
-    and returns the answer along with citation sources.
+    Executes the advanced RAG pipeline with History-Aware Retrieval (HAR).
     """
     
-    formatted_history = format_chat_history(chat_history)
+    # Prepare history
+    history_context = chat_history[:-1] # Everything EXCEPT the last item
+    formatted_history = format_chat_history(history_context)
 
-    # --- LLM Call 1: Query Transformation (HAR) ---
-    transformation_system = "You are a query rewriter. Given the conversation history and the latest user question, generate a concise, standalone search query that captures the full context of the user's intent. Do NOT answer the question. Your output must be only the standalone query."
-    transformation_prompt = f"Chat History:\n{formatted_history}\n\nLatest Question: {question}\n\nStandalone Search Query:"
+    # --- LLM Call 1: Query Transformation & Intent Detection ---
+    # UPDATED: Added logic to detect "General Conversation" vs "Document Queries"
+    transformation_system = (
+        "You are a smart query rewriter. Your task is to analyze the 'Latest Question'.\n"
+        "RULES:\n"
+        "1. **Check for Conversation**: If the user says 'hi', 'hello', 'good morning', 'thanks', 'cool', or 'bye', output EXACTLY: `Conversational: <Appropriate reply>` (e.g., `Conversational: Hello! How can I help you with the document?`).\n"
+        "2. **Check for Follow-ups**: If the user asks 'when?', 'who?', 'what is it?', look at the LAST Assistant message in the history. Combine the implicit subject with the new question. (e.g., Last: 'The engine started.' -> Current: 'When?' -> Output: 'When did the engine start?').\n"
+        "3. **Standard Query**: If it's a specific question, output it as a standalone query.\n"
+        "4. **Output**: Return ONLY the rewritten query OR the Conversational string."
+    )
+    
+    transformation_prompt = f"Chat History:\n{formatted_history}\n\nLatest Question: {question}\n\nOutput:"
 
     transformation_messages = [
         {"role": "system", "content": transformation_system},
         {"role": "user", "content": transformation_prompt}
     ]
+    
+    citations = []
     
     try:
         transformation_response = qa_client.chat_completion(
@@ -103,19 +123,30 @@ def get_pdf_answer(question: str, db: FAISS, qa_client: InferenceClient, chat_hi
         )
         standalone_query = transformation_response.choices[0].message.content.strip()
         
-        if not standalone_query or len(standalone_query.split()) < 3:
+        # --- LOGIC BRANCH: Conversational vs Search ---
+        if standalone_query.startswith("Conversational:"):
+            # If it's just a greeting, return the greeting directly without searching PDF.
+            reply = standalone_query.replace("Conversational:", "").strip()
+            return reply, []
+            
+        # Validation for search queries
+        if not standalone_query or len(standalone_query.split()) < 2:
             standalone_query = question
+        
+        # If the model hallucinates a very long query, fallback to original
+        if len(standalone_query.split()) > 20:
+             standalone_query = question
 
     except Exception as e:
         standalone_query = question
-        st.warning(f"Query rewriting failed ({e}). Searching using original question.")
-
-    # 2. Retrieve relevant context using the standalone query
-    retrieved_docs = db.similarity_search(standalone_query, k=3)
+        # If API fails, assume search
     
-    # Process retrieved documents to build context and citation list
+    # 2. Retrieve relevant context using the standalone query
+    # Uses k=5 to get broader context
+    retrieved_docs = db.similarity_search(standalone_query, k=5)
+    
+    # Process retrieved documents
     context = ""
-    citations = []
     for i, doc in enumerate(retrieved_docs):
         context += doc.page_content + "\n\n"
         page_num = doc.metadata.get('page', 'Unknown')
@@ -128,10 +159,23 @@ def get_pdf_answer(question: str, db: FAISS, qa_client: InferenceClient, chat_hi
     
     st.session_state.chat_history.append({"role": "context", "content": context})
     
-    # 3. LLM Call 2: Final Answer Generation (RAG)
-    system_instruction = "You are an intelligent, helpful, and concise assistant. Your task is to answer the user's question based ONLY on the CONTEXT provided below. If the user asks a conversational question (like 'hello'), reply appropriately. If the user asks about the document, synthesize the answer conversationally. If the answer is not present in the context, politely state that the information could not be found in the document."
+    # --- LLM Call 2: Final Answer Generation (RAG) ---
     
-    user_prompt = f"CONTEXT:\n---\n{context}\n---\n\nUSER QUESTION: {question}"
+    system_instruction = (
+        "You are a helpful document assistant. Answer the User Question using ONLY the provided CONTEXT and CHAT HISTORY. "
+        "GUIDELINES:\n"
+        "1. **Subject Match**: Ensure the Context matches the Subject of the user's question (e.g., if asked about 'Polonnaruwa', ignore text about 'Colonization').\n"
+        "2. **Follow History**: If the answer isn't in the new context, check the Chat History.\n"
+        "3. **Direct Answer**: Be concise. Do not say 'Based on the context'.\n"
+        "4. **No Info**: If the answer is nowhere to be found, say 'I cannot find this information in the document'."
+    )
+    
+    # Inject Chat History into the Final User Prompt
+    user_prompt = (
+        f"PREVIOUS CHAT HISTORY:\n{formatted_history}\n\n"
+        f"NEW CONTEXT FROM DOCUMENT:\n---\n{context}\n---\n\n"
+        f"USER QUESTION: {question} (context: {standalone_query})"
+    )
 
     final_messages = [
         {"role": "system", "content": system_instruction},
